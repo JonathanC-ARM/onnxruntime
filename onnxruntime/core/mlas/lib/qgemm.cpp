@@ -423,7 +423,7 @@ MlasDynamicQgemmPackB(
 {
 #if defined(USE_KLEIDIAI) && !defined(_MSC_VER)
     //No fallback
-    if(MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()){//Still require this since no override
+    if (ArmKleidiAI::SMEInfo::CanUseSME2) {//Still require this since no override
         ArmKleidiAI::MlasDynamicQgemmPackB(N, K, B, Scales, Bias, PackedB);
     }
 #endif
