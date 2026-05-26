@@ -24,20 +24,6 @@
 const KaiF32IMatmulKernel& imatmul_conv = GetKleidiAIF32IMatmulUKernel();
 
 
-// Right-hand-side (weights) cache key
-struct RhsCacheKey {
-    size_t co, ci, kh, kw, dilationh, dilationw;
-    size_t weights_hash;
-
-    bool operator==(const RhsCacheKey& other) const {
-        return co == other.co && ci == other.ci &&
-               kh == other.kh && kw == other.kw &&
-               dilationh == other.dilationh && dilationw == other.dilationw &&
-               weights_hash == other.weights_hash;
-    }
-};
-
-
 // Left-hand-side (input indirection) cache key
 struct LhsCacheKey {
     size_t ci, ih, iw;
@@ -72,19 +58,6 @@ namespace std {
     // Doing this allows standard containers like std::unordered_map to find
     // the appropriate hash function via template specialization, as ADL
     // (argument-dependent lookup) does not apply to std::hash.
-    template<>
-    struct hash<RhsCacheKey> {
-        size_t operator()(const RhsCacheKey& k) const {
-            return k.weights_hash ^
-                (std::hash<size_t>()(k.co) << 1) ^
-                (std::hash<size_t>()(k.ci) << 2) ^
-                (std::hash<size_t>()(k.kh) << 3) ^
-                (std::hash<size_t>()(k.kw) << 4) ^
-                (std::hash<size_t>()(k.dilationh) << 5) ^
-                (std::hash<size_t>()(k.dilationw) << 6);
-        }
-    };
-
     template<>
     struct hash<LhsCacheKey> {
         size_t operator()(const LhsCacheKey& k) const {
@@ -338,47 +311,34 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
                                                           const float* weights, const float* bias,
                                                           MLAS_THREADPOOL* ThreadPool)
 {
-    // Cache of prepacked kai rhs weights and biases. thread_local to prevent interference from parallel sessions.
-    thread_local std::unordered_map<RhsCacheKey, std::shared_ptr<std::byte[]>> rhs_cache;
+    // prepare mlas filter weights for kai rhs packing
+    // dilated nhwc format
+    auto nhwc = NChwToNhwc(co, ci, kh, kw, weights, dilationh, dilationw, true, ThreadPool);
 
-    RhsCacheKey key = { co, ci, kh, kw, dilationh, dilationw, HashWeights(weights) };
+    //dilation, axis swap (n x k -> k x n) where n == co, k == d_kh x d_kw x ci
+    const auto d_kh = ComputeKernelSize(dilationh,kh);
+    const auto d_kw = ComputeKernelSize(dilationw,kw);
 
-    auto found = rhs_cache.find(key);
-    if (found != rhs_cache.end()) {
-        return found->second;
+    //t_weights[d_kh][d_kw][ci][co] = nhwc[co][d_kh][d_kw][ci]
+    auto t_weights = Transpose4D({co,d_kh,d_kw,ci},&nhwc[0],{1,2,3,0});
+
+    const auto packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
+    auto packed = std::shared_ptr<std::byte[]>(new std::byte[packed_size], std::default_delete<std::byte[]>());
+
+    std::vector<float> bias_copy;
+    if (bias) {
+        bias_copy.assign(bias, bias + co);
     } else {
-        // prepare mlas filter weights for kai rhs packing
-        // dilated nhwc format
-        auto nhwc = NChwToNhwc(co, ci, kh, kw, weights, dilationh, dilationw, true, ThreadPool);
-
-
-        //dilation, axis swap (n x k -> k x n) where n == co, k == d_kh x d_kw x ci
-        const auto d_kh = ComputeKernelSize(dilationh,kh);
-        const auto d_kw = ComputeKernelSize(dilationw,kw);
-
-        //t_weights[d_kh][d_kw][ci][co] = nhwc[co][d_kh][d_kw][ci]
-        auto t_weights = Transpose4D({co,d_kh,d_kw,ci},&nhwc[0],{1,2,3,0});
-
-        const auto packed_size = kai_get_rhs_packed_size_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(co,d_kh*d_kw,ci);
-        auto packed = std::shared_ptr<std::byte[]>(new std::byte[packed_size], std::default_delete<std::byte[]>());
-
-        rhs_cache[key] = packed;
-
-        std::vector<float> bias_copy;
-        if (bias) {
-            bias_copy.assign(bias, bias + co);
-        } else {
-            bias_copy.resize(co, 0.0f);
-        }
-
-        KLEIDIAI_KERNEL_LOG("kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme"
-                            << " N=" << co << " k_chunk_count=" << (d_kh*d_kw) << " k_chunk_length=" << ci << " rhs_stride_row=" << (co * sizeof(float)));
-        kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(
-            co, d_kh*d_kw, ci, co * sizeof(float), &t_weights[0], bias_copy.data(), packed.get()
-        );
-
-        return packed;
+        bias_copy.resize(co, 0.0f);
     }
+
+    KLEIDIAI_KERNEL_LOG("kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme"
+                        << " N=" << co << " k_chunk_count=" << (d_kh*d_kw) << " k_chunk_length=" << ci << " rhs_stride_row=" << (co * sizeof(float)));
+    kai_run_rhs_imatmul_pack_kxn_x32p2vlx1b_x32_x32_sme(
+        co, d_kh*d_kw, ci, co * sizeof(float), &t_weights[0], bias_copy.data(), packed.get()
+    );
+
+    return packed;
 }
 
 static std::shared_ptr<const void*[]> LhsPtrFill(const size_t ci, const size_t ih, const size_t iw,
